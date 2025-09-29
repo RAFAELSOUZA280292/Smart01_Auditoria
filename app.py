@@ -1,9 +1,8 @@
 # app.py
 import io
 import re
-import base64
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 
 import streamlit as st
 from reportlab.lib.pagesizes import A4
@@ -16,24 +15,18 @@ from reportlab.lib.units import mm
 def try_read_bytes(uploaded) -> bytes:
     if uploaded is None:
         return b""
-    # Streamlit UploadedFile é um buffer reutilizável: use getvalue()
     try:
         return uploaded.getvalue()
     except Exception:
         return uploaded.read()
 
 def detect_encoding_and_text(b: bytes) -> Tuple[str, str]:
-    """
-    Tenta detectar encoding (com chardet, se disponível) e devolve (encoding, text).
-    Sempre retorna texto (fallback latin-1).
-    """
     enc = "latin-1"
     try:
-        import chardet  # opcional
+        import chardet
         det = chardet.detect(b[:200_000])
         if det and det.get("encoding"):
             enc = det["encoding"]
-            # preferir latin-1 quando chardet indicar ascii/low-confidence
             if enc.lower() in ("ascii",) or (det.get("confidence", 0) < 0.6):
                 enc = "latin-1"
     except Exception:
@@ -46,33 +39,21 @@ def detect_encoding_and_text(b: bytes) -> Tuple[str, str]:
         text = b.decode(enc, errors="ignore")
     return enc, text
 
-def extract_first(line: str, idx: int) -> str:
-    parts = [p.strip() for p in line.strip().split("|")]
-    return parts[idx] if len(parts) > idx else ""
-
 def parse_header_0000(text: str) -> Dict[str, str]:
-    """
-    Retorna: {competencia, empresa, cnpj, uf}
-    Layout 0000: |0000|COD_VER|COD_FIN|DT_INI|DT_FIN|NOME|CNPJ|UF?… (varia por versão)
-    Pegamos NOME(6), CNPJ(7), DT_INI (4) e UF (9) se existir.
-    """
     empresa = cnpj = uf = ""
     competencia = ""
     for line in text.splitlines()[:120]:
         if line.startswith("|0000|"):
             parts = [p.strip() for p in line.split("|")]
-            # datas
             if len(parts) > 4 and len(parts[4]) == 8 and parts[4].isdigit():
                 dt_ini = parts[4]  # DDMMAAAA
                 mes = dt_ini[2:4]
                 ano = dt_ini[4:8]
                 competencia = f"{mes}/{ano}"
-            # empresa/cnpj
             if len(parts) > 6:
                 empresa = parts[6]
             if len(parts) > 7:
                 cnpj = parts[7]
-            # uf (nem sempre em 9, mas tentamos)
             if len(parts) > 9:
                 uf = parts[9]
             break
@@ -84,44 +65,30 @@ def parse_header_0000(text: str) -> Dict[str, str]:
     }
 
 def has_movimento(text: str) -> bool:
-    """
-    Sinaliza 'com movimento' se encontrar quaisquer documentos/itens (C100/C170, D100/D190) ou apurações E110/E200/E300.
-    """
     patterns = (r"\|C100\|", r"\|C170\|", r"\|D100\|", r"\|D190\|", r"\|E110\|", r"\|E200\|", r"\|E300\|")
     for p in patterns:
         if re.search(p, text):
             return True
     return False
 
-def summarize_ajustes(text: str) -> Dict[str, Dict[str, float]]:
-    """
-    Resume C195/C197/E111/E115/E116:
-    - retorna dict por registro com contagem e soma de valores (quando houver).
-    """
-    resumo = {
-        "C195": {"qtd": 0, "valor": 0.0},
-        "C197": {"qtd": 0, "valor": 0.0},
-        "E111": {"qtd": 0, "valor": 0.0},
-        "E115": {"qtd": 0, "valor": 0.0},
-        "E116": {"qtd": 0, "valor": 0.0},
-    }
+def summarize_ajustes(text: str):
+    resumo = {k: {"qtd": 0, "valor": 0.0} for k in ["C195", "C197", "E111", "E115", "E116"]}
+
     def parse_br_to_float(s: str) -> float:
         s = (s or "").strip()
         if not s:
             return 0.0
-        # tenta EN
         try:
             return float(s.replace(" ", ""))
         except Exception:
             pass
-        # tenta BR
         try:
             return float(s.replace(".", "").replace(",", "."))
         except Exception:
             return 0.0
 
     for line in text.splitlines():
-        if not line or "|" not in line:
+        if "|" not in line:
             continue
         parts = [p.strip() for p in line.split("|")]
         if len(parts) < 2:
@@ -131,7 +98,6 @@ def summarize_ajustes(text: str) -> Dict[str, Dict[str, float]]:
             resumo["C195"]["qtd"] += 1
         elif rec == "C197":
             resumo["C197"]["qtd"] += 1
-            # valores podem estar no final (VL_ICMS ou VL_OUTROS). somamos tudo que for número > 0
             acc = 0.0
             for p in parts[2:]:
                 v = parse_br_to_float(p)
@@ -157,7 +123,6 @@ DIFAL_KWS = {
     "uso e consumo","uso/consumo","imobilizado","ativo permanente","ativo imobilizado","fecp","fundo combate pobreza"
 }
 DIFAL_WHITELIST_CODES = {
-    # exemplos comuns por UF (não exaustivo, mas ajuda)
     "SP": {"SP000207","SP40090207","SP10090718"},
     "RJ": {"RJ70000001","RJ70000002","RJ70000003","RJ70000006"},
     "PR": {"PR000081"},
@@ -176,33 +141,26 @@ def norm(s: str) -> str:
     s = re.sub(r"[\s\.\-_/\\]+"," ", s).strip()
     return s
 
-def difal_auditoria(text: str, uf: str) -> Dict[str, any]:
-    """
-    Analisa entradas CFOP 2551/2556 e tenta cruzar evidências de ajustes (C195/C197/E111/E115/E116).
-    Retorna: contagem itens 2551/2556, NFs distintas, lista de códigos detectados, flag tem_evidencia.
-    """
-    # coleta CFOPs 2551/2556 (C170; índice do CFOP varia, então tentamos vários)
+def difal_auditoria(text: str, uf: str):
     nfs_255x = set()
     itens_255x = 0
     current_doc = {"serie":"", "numero":"", "chave":""}
 
     for line in text.splitlines():
-        if not line or "|" not in line: 
+        if "|" not in line:
             continue
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 2: 
+        if len(parts) < 2:
             continue
         rec = parts[1]
 
         if rec == "C100":
-            # |C100|IND_OPER|...|SER|NUM_DOC|CHV_NFE|...
             current_doc = {
                 "serie": parts[7] if len(parts) > 7 else "",
                 "numero": parts[8] if len(parts) > 8 else "",
                 "chave":  parts[9] if len(parts) > 9 else "",
             }
         elif rec == "C170":
-            # tenta achar CFOP
             cfop = ""
             for idx in (11,10,12,13,9):
                 if len(parts) > idx and parts[idx]:
@@ -216,16 +174,16 @@ def difal_auditoria(text: str, uf: str) -> Dict[str, any]:
                 if nf_id.strip("|"):
                     nfs_255x.add(nf_id)
 
-    # extrai códigos/descrições nos ajustes
     codigos = set()
     descrs = []
+
     def add_codigo(c: str):
         c = (c or "").strip().upper()
         if c:
             codigos.add(c)
 
     for line in text.splitlines():
-        if not line or "|" not in line:
+        if "|" not in line:
             continue
         parts = [p.strip() for p in line.split("|")]
         if len(parts) < 2:
@@ -244,12 +202,10 @@ def difal_auditoria(text: str, uf: str) -> Dict[str, any]:
             if len(parts) > 4:
                 descrs.append(parts[4])
         elif rec == "E116":
-            # cod_orfica/cod_rec/descr complementares
             if len(parts) > 2: add_codigo(parts[2])
             if len(parts) > 5: add_codigo(parts[5])
             if len(parts) > 9: descrs.append(parts[9])
 
-    # heurística de evidência: whitelist por UF OU palavras-chave na descrição
     uf = (uf or "").upper()
     wl = DIFAL_WHITELIST_CODES.get(uf, set())
     in_whitelist = any((c in wl) for c in codigos)
@@ -264,42 +220,22 @@ def difal_auditoria(text: str, uf: str) -> Dict[str, any]:
     }
 
 def detect_assinatura(bytes_data: bytes, text: str) -> bool:
-    """
-    Detecta presença de assinatura digital embutida no arquivo SPED (rodapé binário com cadeia ICP-Brasil).
-    Estratégias:
-    - presença de muitos bytes não-ASCII no rodapé
-    - presença de strings 'ICP-Brasil', 'AC ' conhecidas
-    - comprimento após |9999| significativo com binário
-    """
-    # 1) Procura palavras-chave no texto (muitos arquivos “assinado” carregam strings legíveis)
     if re.search(r"ICP[- ]?Brasil", text, flags=re.IGNORECASE) or \
        re.search(r"AC\s+SOLUTI", text, flags=re.IGNORECASE) or \
        re.search(r"Certificado", text, flags=re.IGNORECASE):
         return True
-
-    # 2) Checa “cauda binária” após |9999|
-    tail = b""
-    try:
-        # pega últimos 50kB
-        tail = bytes_data[-50_000:]
-    except Exception:
-        tail = bytes_data
-
-    # proporção de bytes não-texto
+    tail = bytes_data[-50_000:] if len(bytes_data) >= 50_000 else bytes_data
     non_text = sum(1 for bt in tail if bt < 9 or bt == 11 or bt == 12 or bt > 126)
     ratio = non_text / max(1, len(tail))
-    if ratio > 0.20 and len(tail) > 2000:  # 20% de bytes não-ASCII em cauda razoável
+    if ratio > 0.20 and len(tail) > 2000:
         return True
-
     return False
 
 def load_logo_bytes(logo_upload, fallback_path: str = "Image_smart01.png") -> Optional[bytes]:
-    # prioriza upload via sidebar
     if logo_upload is not None:
         b = try_read_bytes(logo_upload)
         if b:
             return b
-    # tenta fallback do repo
     try:
         with open(fallback_path, "rb") as f:
             return f.read()
@@ -325,7 +261,16 @@ enc, text = detect_encoding_and_text(file_bytes)
 cols = st.columns([1, 3])
 with cols[0]:
     if logo_bytes:
-        st.image(logo_bytes, caption="Smart01", use_container_width=True)
+        # usar use_column_width (correto) e fallback com PIL se necessário
+        try:
+            st.image(logo_bytes, caption="Smart01", use_column_width=True)
+        except TypeError:
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(logo_bytes))
+                st.image(img, caption="Smart01", use_column_width=True)
+            except Exception:
+                st.write("Logo carregada (não foi possível pré-visualizar)")
 with cols[1]:
     st.title("Auditoria SPED • Smart01")
     st.caption("Resumo rápido de movimento, ajustes e DIFAL (entradas 2551/2556)")
@@ -383,7 +328,6 @@ def generate_pdf(logo_png: Optional[bytes],
     if logo_png:
         try:
             img = ImageReader(io.BytesIO(logo_png))
-            # altura fixa ~18mm, mantém proporção
             img_h = 18 * mm
             iw, ih = img.getSize()
             img_w = iw * (img_h / ih)
@@ -465,7 +409,7 @@ pdf_bytes = generate_pdf(
     hdr=hdr,
     diagnostico=diagnostico,
     assinatura=assinatura,
-    res_aj=res_aj,
+    res_aj=summarize_ajustes(text),
     difal=difal
 )
 
