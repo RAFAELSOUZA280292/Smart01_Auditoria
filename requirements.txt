@@ -1,6 +1,3 @@
-streamlit
-pandas
-xlsxwriter
-chardet
-reportlab
-Pillow
+streamlit==1.38.0
+reportlab==4.2.2
+chardet==5.2.0
